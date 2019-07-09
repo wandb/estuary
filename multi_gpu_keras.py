@@ -1,17 +1,17 @@
 import argparse
 import time
 import os
+import sys
 
 import tensorflow as tf
-
+from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import Callback
+from tensorflow.keras.layers import Conv2D, MaxPooling2D
+from tensorflow.keras.layers import Activation, Dropout, Flatten, Dense
+from tensorflow.keras.models import Sequential
 from tensorflow.keras import optimizers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D
-from tensorflow.keras.layers import Activation, Dropout, Flatten, Dense
-from tensorflow.keras import backend as K
 from tensorflow.keras.utils import multi_gpu_model
 
 import wandb
@@ -21,12 +21,22 @@ from wandb.keras import WandbCallback
 #--------------------------------
 img_width, img_height = 299, 299
 
+# utils
+#--------------------------------
+def load_class_from_module(module_name):
+  components = module_name.split('.')
+  mod = __import__(components[0])
+  for comp in components[1:]:
+    mod = getattr(mod, comp)
+  return mod
+
 def load_optimizer(optimizer, learning_rate):
-  optimizer_path = "optimizers." + optimizer
-  optimizer_module = __import__(optimizer_path, fromlist=[''])
+  """ Dynamically load relevant optimizer """
+  optimizer_path = "tensorflow.keras.optimizers." + optimizer
+  optimizer_module = load_class_from_module(optimizer_path)
   return optimizer_module(lr=learning_rate)  
 
-def build_core_model(dropout, num_classes):
+def build_core_model(args):
   """ Build core 7-layer model """
   if K.image_data_format() == 'channels_first':
     input_shape = (3, img_width, img_height)
@@ -51,38 +61,13 @@ def build_core_model(dropout, num_classes):
 
   model.add(Flatten())
   model.add(Dense(128, activation='relu'))
-  model.add(Dropout(dropout))
-  model.add(Dense(num_classes, activation='softmax'))
-  return model
-
-def build_parallel_gpu_model(args):
-  """ Build a parallel model over several gpus """
-  with tf.device('/cpu:0'):
-    model = build_core_model(args.dropout, args.num_classes)
-
-  optimizer = load_optimizer(args.optimizer, args.learning_rate)
-  # log model here before we parallelize it
-  log_model_params(model, args)
-
-  parallel_model = multi_gpu_model(model, gpus=gpus)
-  parallel_model.compile(loss='categorical_crossentropy',
-                optimizer=lr_optimizer,
-                metrics=['accuracy'])
-  print(parallel_model.summary())
-  return parallel_model
-
-def build_single_gpu_model(args):
-  """ Build a regular model """
-  model = build_core_model(args.dropout, args.num_classes)
-
-  lr_optimizer = load_optimizer(args.optimizer, args.learning_rate)
-  model.compile(loss='categorical_crossentropy',
-                optimizer=lr_optimizer,
-                metrics=['accuracy'])
+  model.add(Dropout(args.dropout))
+  model.add(Dense(args.num_classes, activation='softmax')) 
   print(model.summary())
   return model
 
 def build_distributed_model(args):
+  """ Load core model and optionally parallelize across the given number of gpus""" 
   if args.gpus == 1:
     model = build_core_model(args)
   else:
@@ -99,21 +84,21 @@ def build_distributed_model(args):
 
 def log_params(args):
   """ Extract params of interest about the model (e.g. number of different layer types).
-      Log these and any experiment-level settings to wandb """
+  Log these and any experiment-level settings to wandb """
   wandb.config.update({
     "epochs" : args.epochs,
     "batch_size" : args.batch_size,
     "n_train" : args.num_train,
     "n_valid" : args.num_valid,
-    "optimizer" : args.optimizer,
+    "optimizer" : args.optimizer.lower(),
     "dropout" : args.dropout,
-    "GPU" : args.distrib
+    "GPU" : args.gpus
   })
 
 def train_multi_gpu_model(args):
-
+  """ Train a data-parallel model across multiple gpus """ 
   wandb.init(project="estuary")
-   # data generator from Keras finetuning tutorial
+  
   train_datagen = ImageDataGenerator(
     rescale=1. / 255,
     shear_range=0.2,
@@ -121,12 +106,6 @@ def train_multi_gpu_model(args):
     horizontal_flip=True)
   test_datagen = ImageDataGenerator(rescale=1. / 255)
   
-#  if args.distrib == 1:
-    # this is not a distributed model
-#    model = build_single_gpu_model(args)
-#    log_model_params(model, args)
-#  else:
-#    model = build_parallel_gpu_model(args.optimizer, arg None, wandb.config, args)
   model = build_distributed_model(args)
   log_params(args)
 
@@ -154,9 +133,6 @@ def train_multi_gpu_model(args):
     callbacks = callbacks,
     validation_steps=args.num_valid // args.batch_size)
 
-  #save_model_filename = args.model_name + ".h5"
-  #model.save_weights(save_model_filename)
-
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
@@ -169,6 +145,14 @@ if __name__ == "__main__":
     type=str,
     default="",
     help="Name of this model/run (model will be saved to this file)")
+  parser.add_argument(
+    "-g",
+    "--gpus",
+    type=int,
+    default=0,
+    help="Distribute run over this many GPUs"
+  )
+
   #############################
   # Mostly fixed params
   #--------------------------
@@ -200,15 +184,15 @@ if __name__ == "__main__":
     "-o",
     "--optimizer",
     type=str,
-    default="adam",
-    help="Learning optimizer")
+    default="Adam",
+    help="Learning optimizer (match Keras package name exactly")
   parser.add_argument(
     "-lr",
     "--learning_rate",
     type=float,
     default=0.001,
     help="Learning rate for default optimizer")
- parser.add_argument(
+  parser.add_argument(
     "-nt",
     "--num_train",
     type=int,
@@ -220,7 +204,7 @@ if __name__ == "__main__":
     type=int,
     default=2000,
     help="Number of validation examples per class")
-   parser.add_argument(
+  parser.add_argument(
     "-t",
     "--train_data",
     type=str,
@@ -237,14 +221,7 @@ if __name__ == "__main__":
     "--dry_run",
     action="store_true",
     help="Dry run (do not log to wandb)")
-  parser.add_argument(
-    "-g",
-    "--gpus",
-    type=int,
-    default=0,
-    help="Distribute run over this many GPUs"
-  )
-
+ 
   args = parser.parse_args()
   # easier testing--don't log to wandb if dry run is set
   if args.dry_run:
