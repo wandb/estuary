@@ -1,3 +1,9 @@
+# multi_gpu_keras.py
+#----------------------
+# training a simple 7-layer CNN with data parallelism in Keras,
+# using the built-in multi_gpu_model() function, instrumented
+# with wandb
+
 import argparse
 import time
 import os
@@ -36,6 +42,26 @@ def load_optimizer(optimizer, learning_rate):
   optimizer_module = load_class_from_module(optimizer_path)
   return optimizer_module(lr=learning_rate)  
 
+def log_params(args):
+  """ Extract params of interest about the model. Log these and any 
+  experiment-level settings to wandb. Note that the model definition
+  will change after the model is distributed across multiple GPUs--log
+  any parameters specific to the core model or any architectural
+  details (e.g. the number of convolutional layers or fully-connected
+  layers) before parallelizing the model with multi_gpu_model() """
+  wandb.config.update({
+    "epochs" : args.epochs,
+    "batch_size" : args.batch_size,
+    "n_train" : args.num_train,
+    "n_valid" : args.num_valid,
+    "optimizer" : args.optimizer.lower(),
+    "dropout" : args.dropout,
+    "lr" : args.learning_rate,
+    "GPU" : args.gpus
+  })
+
+# model definition & training
+#--------------------------------
 def build_core_model(args):
   """ Build core 7-layer model """
   if K.image_data_format() == 'channels_first':
@@ -69,8 +95,11 @@ def build_core_model(args):
 def build_distributed_model(args):
   """ Load core model and optionally parallelize across the given number of gpus""" 
   if args.gpus == 1:
+    # for 1 GPU, simply load the core model
     model = build_core_model(args)
+    core_model = model
   else:
+    # for >1 GPU, load the core model on CPU and then distribute via Keras
     with tf.device('/cpu:0'):
       core_model = build_core_model(args)
     model = multi_gpu_model(core_model, gpus=args.gpus)
@@ -80,20 +109,8 @@ def build_distributed_model(args):
                 optimizer=lr_optimizer,
                 metrics=['accuracy'])
   print(model.summary())
-  return model
-
-def log_params(args):
-  """ Extract params of interest about the model (e.g. number of different layer types).
-  Log these and any experiment-level settings to wandb """
-  wandb.config.update({
-    "epochs" : args.epochs,
-    "batch_size" : args.batch_size,
-    "n_train" : args.num_train,
-    "n_valid" : args.num_valid,
-    "optimizer" : args.optimizer.lower(),
-    "dropout" : args.dropout,
-    "GPU" : args.gpus
-  })
+  # keep a reference to the original/core model to save it correctly at the end
+  return model, core_model
 
 def train_multi_gpu_model(args):
   """ Train a data-parallel model across multiple gpus """ 
@@ -106,7 +123,7 @@ def train_multi_gpu_model(args):
     horizontal_flip=True)
   test_datagen = ImageDataGenerator(rescale=1. / 255)
   
-  model = build_distributed_model(args)
+  parallel_model, core_model = build_distributed_model(args)
   log_params(args)
 
   train_generator = train_datagen.flow_from_directory(
@@ -125,13 +142,18 @@ def train_multi_gpu_model(args):
 
   callbacks = [WandbCallback()]
 
-  model.fit_generator(
+  parallel_model.fit_generator(
     train_generator,
     steps_per_epoch=args.num_train // args.batch_size,
     epochs=args.epochs,
     validation_data=validation_generator,
     callbacks = callbacks,
     validation_steps=args.num_valid // args.batch_size)
+
+  # to correctly save the weights/model after data parallel training,
+  # we actually need to save the original/core model
+  # save_model_filename = args.model_name + ".h5"
+  # core_model.save_weights(save_model_filename)
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -184,7 +206,7 @@ if __name__ == "__main__":
     "-o",
     "--optimizer",
     type=str,
-    default="Adam",
+    default="RMSprop",
     help="Learning optimizer (match Keras package name exactly")
   parser.add_argument(
     "-lr",
@@ -208,13 +230,13 @@ if __name__ == "__main__":
     "-t",
     "--train_data",
     type=str,
-    default="/mnt/train-data/inaturalist_12K/train",
+    default="/mnt/disks/datasets/inaturalist_12K/train",
     help="Absolute path to training data")
   parser.add_argument(
     "-v",
     "--val_data",
     type=str,
-    default="/mnt/train-data/inaturalist_12K/val",
+    default="/mnt/disks/datasets/inaturalist_12K/val",
     help="Absolute path to validation data")
   parser.add_argument(
     "-q",
