@@ -183,7 +183,7 @@ if __name__ == "__main__":
     "--batch_size",
     type=int,
     default=64,
-    help="Batch size")
+    help="Original batch size (effective subbatch size = orig batch_size / # gpus)")
   parser.add_argument(
     "-c",
     "--num_classes",
